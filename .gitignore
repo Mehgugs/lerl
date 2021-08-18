@@ -1,0 +1,10 @@
+*.so
+*.obj
+*.exp
+*.bat
+*.o
+*.dll
+*.def
+*.lib
+.vscode/**
+test/**
