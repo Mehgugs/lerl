@@ -17,6 +17,17 @@
 #define DEFAULT_RECURSE_LIMIT 256
 #define INITIAL_BUFFER_SIZE (1024 * 1024)
 
+#define check_ret(n) if ((ret) != 0) { \
+    e->ret = (ret); \
+    lua_warning(L, "lerl_encode.pack: Issue when packing in " n " return non-zero.", false); \
+    return ret; \
+}
+
+#define take_ret() if ((ret) != 0) { \
+    e->ret = (ret); \
+    return ret; \
+}
+
 typedef struct {
     erlpack_buffer pk;
     int ret;
@@ -26,14 +37,15 @@ static lerl_encoder* lerl_get_encoder(lua_State* L, int at) {
     return luaL_checkudata(L, at, lerl_encoder_type);
 }
 
-static int lerl_new_encoder(lua_State* L) {
+static int lerl_new_encoder2(lua_State* L, bool skip_version) {
 
     lerl_encoder* the_encoder = lua_newuserdata(L, sizeof(lerl_encoder));
 
     the_encoder->pk.buf = (char*)malloc(INITIAL_BUFFER_SIZE);
     the_encoder->pk.allocated_size = INITIAL_BUFFER_SIZE;
     the_encoder->pk.length = 0;
-    the_encoder->ret = erlpack_append_version(&the_encoder->pk);
+    if (!skip_version)
+        the_encoder->ret = erlpack_append_version(&the_encoder->pk);
 
     if (the_encoder->ret != 0)
         return luaL_error(L, "lerl_encoder.new: Unable to set version header.");
@@ -41,6 +53,10 @@ static int lerl_new_encoder(lua_State* L) {
     luaL_getmetatable(L, lerl_encoder_type);
     lua_setmetatable(L, -2);
     return 1;
+}
+
+static int lerl_new_encoder(lua_State* L) {
+    return lerl_new_encoder2(L, false);
 }
 
 static int lerl_encoder_gc(lua_State* L) {
@@ -62,101 +78,131 @@ static int lerl_pack_at(lua_State* L, int encoder_at, int object_at, int limit) 
 
     lerl_encoder* e = lerl_get_encoder(L, encoder_at);
     int the_type = lua_type(L, object_at);
+    int ret;
     switch (the_type) {
-        case LUA_TNIL:
-            e->ret = erlpack_append_nil(&e->pk);
+        case LUA_TNIL:;
+            ret = erlpack_append_nil(&e->pk);
+            check_ret("pack nil")
             break;
-        case LUA_TBOOLEAN:
-            e->ret = lua_toboolean(L, object_at) ? erlpack_append_true(&e->pk) : erlpack_append_false(&e->pk);
+        case LUA_TBOOLEAN:;
+            ret = lua_toboolean(L, object_at) ? erlpack_append_true(&e->pk) : erlpack_append_false(&e->pk);
+            check_ret("pack boolean")
             break;
         case LUA_TNUMBER:
             if (lua_isinteger(L, object_at)) {
                 lua_Integer I = lua_tointeger(L, object_at);
+
                 if (0 <= I && I <= 255) {
-                    e->ret = erlpack_append_small_integer(&e->pk, (unsigned char)I);
+                    ret = erlpack_append_small_integer(&e->pk, (unsigned char)I);
+                    check_ret("pack small integer")
                 } else {
 #if LUA_INT_TYPE == LUA_INT_LONGLONG
-                    e->ret = erlpack_append_long_long(&e->pk, I);
+                    ret = erlpack_append_long_long(&e->pk, I);
+                    check_ret("pack long long integer")
 #elif LUA_INT_TYPE == LUA_INT_LONG
-                    e->ret = erlpack_append_integer(&e->pk, I);
+                    ret = erlpack_append_integer(&e->pk, I);
+                    check_ret("pack long integer")
 #elif LUA_INT_TYPE == LUA_INT_INT
-                    e->ret = erlpack_append_integer(&e->pk, I);
+                    ret = erlpack_append_integer(&e->pk, I);
+                    check_ret("pack integer")
 #endif
                 }
             } else {
                 lua_Number N = lua_tonumber(L, object_at);
-                e->ret = erlpack_append_double(&e->pk, (double)N);
+                ret = erlpack_append_double(&e->pk, (double)N);
+                check_ret("pack double")
             }
         break;
 
         case LUA_TSTRING:;
             size_t len;
             const char *str = lua_tolstring(L, object_at, &len);
-            e->ret = erlpack_append_binary(&e->pk, str, len);
+            ret = erlpack_append_binary(&e->pk, str, len);
+            check_ret("pack string")
             break;
         case LUA_TTABLE:
             if (luaL_getmetafield(L, object_at, "__lerl_type") == LUA_TSTRING) {
-                const char* ttype = lua_tostring(L, -1);
-                if (strcmp(ttype, "lerl.array") == 0) {
+                size_t flen;
+                const char* ttype = lua_tolstring(L, -1, &flen);
+
+                if (flen == 5 && strncmp(ttype, "array", 5) == 0) {
                     lua_pop(L, 1);
-                    size_t size = lua_rawlen(L, object_at);
+                    size_t count = 0;
 
-                    if (size > INT32_MAX) {
-                        return luaL_error(L, "lerl_encoder.pack: Array contains too many items!");
-                    }
+                    ret = erlpack_append_list_header(&e->pk, 0);
+                    size_t destination = e->pk.length - 4;
 
-                    int ret = erlpack_append_list_header(&e->pk, size);
-                    e->ret = ret;
-                    if (ret != 0) {
-                        return ret;
-                    }
-                    for (lua_Integer i = 1; i <= size; i++)
-                    {
-                        lua_geti(L, object_at, i);
-                        int ret = lerl_pack_at(L, 1, -1, limit - 1);
-                        lua_pop(L, 1);
-                        if (ret != 0) {
-                            e->ret = ret;
-                            return ret;
-                        }
-                    }
-                    e->ret = erlpack_append_nil_ext(&e->pk);
+                    check_ret("pack list header")
 
-                } else if (strcmp(ttype, "lerl.map") == 0) {
-                    lua_pop(L, 1);
-                    int count = 0;
-                    lua_pushnil(L);
-                    while (lua_next(L, 2) != 0) {
+                    for (;;) {
                         count = count + 1;
-                    }
-                    erlpack_append_map_header(&e->pk, count);
-                    lua_pop(L, 1);
+                        lua_geti(L, object_at, count);
+                        if (lua_isnoneornil(L, -1)) break;
 
+                        ret = lerl_pack_at(L, 1, -1, limit - 1);
+                        lua_pop(L, 1);
+                        take_ret()
+                    }
+
+                    count = count - 1;
+
+                    size_t end = e->pk.length;
+                    e->pk.length = destination;
+                    char count_buf[4] = {0};
+                    _erlpack_store32(count_buf, count);
+                    ret = erlpack_buffer_write(&e->pk, (const char *)count_buf, 4);
+                    e->pk.length = end;
+
+                    check_ret("upsert list length")
+
+                    ret = erlpack_append_nil_ext(&e->pk);
+
+                    check_ret("pack nil tail")
+
+                } else if (flen == 3 && strcmp(ttype, "map") == 0) {
+                    lua_pop(L, 1);
+                    size_t count = 0;
+
+
+                    ret = erlpack_append_map_header(&e->pk, count);
+
+                    check_ret("pack map header")
+
+                    size_t destination = e->pk.length - 4;
                     lua_pushnil(L);
                     while (lua_next(L, object_at) != 0) {
+                        count = count + 1;
                         if (count > INT32_MAX)
                             return luaL_error(L, "lerl_encoder.pack: lerl.map has too many key-value properties!");
-                        int ret;
+
+
                         ret = lerl_pack_at(L, 1, -2, limit - 1);
-                        if (ret != 0) {
-                            e->ret = ret;
-                            return ret;
-                        }
+                        take_ret()
+
                         ret = lerl_pack_at(L, 1, -1, limit - 1);
-                        if (ret != 0) {
-                            e->ret = ret;
-                            return ret;
-                        }
+                        take_ret()
+
                         lua_pop(L, 1);
                     }
                     lua_pop(L, 1);
 
-                } else if (strcmp(ttype, "lerl.user") == 0) {
+                    size_t end = e->pk.length;
+                    e->pk.length = destination;
+                    char count_buf[4] = {0};
+                    _erlpack_store32(count_buf, count);
+                    ret = erlpack_buffer_write(&e->pk, (const char *)count_buf, 4);
+                    e->pk.length = end;
+
+                    check_ret("upsert map length")
+
+                } else if (flen == 4 && strncmp(ttype, "user", 4) == 0) {
                     if (luaL_getmetafield(L, object_at, "__lerl_user") != LUA_TNIL) {
                         lua_pushvalue(L, object_at);
                         lua_call(L, 2, 1);
-                        lerl_pack_at(L, encoder_at, -1, limit - 1);
+                        return lerl_pack_at(L, encoder_at, -1, limit - 1);
                     }
+                } else {
+                    return luaL_error(L, "lerl_encoder.pack: Unsure what to do with a table with a strange lerl_type set.");
                 }
             } else {
                 return luaL_error(L, "lerl_encoder.pack: Unsure what to do with a table with no lerl_type set.");
@@ -904,13 +950,13 @@ static const char *lerl_empty = "lerl_empty";
 LUALIB_API int luaopen_lerl(lua_State* L) {
     luaL_newmetatable(L, lerl_array_mt);
     lua_pushliteral(L, "__lerl_type");
-    lua_pushliteral(L, "lerl.array");
+    lua_pushliteral(L, "array");
     lua_settable(L, -3);
     lua_pop(L, 1);
 
     luaL_newmetatable(L, lerl_map_mt);
     lua_pushliteral(L, "__lerl_type");
-    lua_pushliteral(L, "lerl.map");
+    lua_pushliteral(L, "map");
     lua_settable(L, -3);
     lua_pop(L, 1);
 
