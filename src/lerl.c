@@ -44,6 +44,7 @@ static int lerl_new_encoder2(lua_State* L, bool skip_version) {
     the_encoder->pk.buf = (char*)malloc(INITIAL_BUFFER_SIZE);
     the_encoder->pk.allocated_size = INITIAL_BUFFER_SIZE;
     the_encoder->pk.length = 0;
+    the_encoder->ret = 0;
     if (!skip_version)
         the_encoder->ret = erlpack_append_version(&the_encoder->pk);
 
@@ -136,10 +137,14 @@ static int lerl_pack_at(lua_State* L, int encoder_at, int object_at, int limit) 
 
                     for (;;) {
                         count = count + 1;
-                        lua_geti(L, object_at, count);
-                        if (lua_isnoneornil(L, -1)) break;
 
-                        ret = lerl_pack_at(L, 1, -1, limit - 1);
+                        if (lua_geti(L, object_at, count) == LUA_TNIL) {
+                            lua_pop(L, 1);
+                            break;
+                        }
+
+                        ret = lerl_pack_at(L, 1, lua_gettop(L), limit - 1);
+
                         lua_pop(L, 1);
                         take_ret()
                     }
@@ -170,21 +175,22 @@ static int lerl_pack_at(lua_State* L, int encoder_at, int object_at, int limit) 
 
                     size_t destination = e->pk.length - 4;
                     lua_pushnil(L);
+
                     while (lua_next(L, object_at) != 0) {
                         count = count + 1;
                         if (count > INT32_MAX)
                             return luaL_error(L, "lerl_encoder.pack: lerl.map has too many key-value properties!");
 
+                        int top = lua_gettop(L);
 
-                        ret = lerl_pack_at(L, 1, -2, limit - 1);
+                        ret = lerl_pack_at(L, 1, top - 1, limit - 1);
                         take_ret()
 
-                        ret = lerl_pack_at(L, 1, -1, limit - 1);
+                        ret = lerl_pack_at(L, 1, top, limit - 1);
                         take_ret()
 
                         lua_pop(L, 1);
                     }
-                    lua_pop(L, 1);
 
                     size_t end = e->pk.length;
                     e->pk.length = destination;
@@ -313,6 +319,7 @@ static int lerl_new_decoder(lua_State* L) {
     the_decoder->size = size;
     the_decoder->offset = 0;
     the_decoder->empty_ref = empty_ref;
+    the_decoder->invalid = 0;
 
     luaL_getmetatable(L, lerl_decoder_type);
     lua_setmetatable(L, -2);
@@ -321,6 +328,32 @@ static int lerl_new_decoder(lua_State* L) {
         return luaL_error(L, "lerl_decoder.new: Version mismatch!");
 
     return 1;
+}
+
+static int lerl_empty_decoder(lua_State* L) {
+
+    int empty_ref;
+    if (lua_gettop(L) >= 1 && !lua_isnoneornil(L, 1)) {
+        lua_settop(L, 1);
+        lua_pushvalue(L, 1);
+        empty_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_getfield(L, LUA_REGISTRYINDEX, "lerl_empty");
+        empty_ref = lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+
+    lerl_decoder* the_decoder = lua_newuserdata(L, sizeof(lerl_decoder));
+    the_decoder->data = NULL;
+    the_decoder->size = 0;
+    the_decoder->offset = 0;
+    the_decoder->empty_ref = empty_ref;
+    the_decoder->invalid = true;
+
+    luaL_getmetatable(L, lerl_decoder_type);
+    lua_setmetatable(L, -2);
+
+    return true;
 }
 
 static int lerl_reset_decoder(lua_State* L) {
@@ -604,7 +637,7 @@ static int lerl_decodeStringAsList(lua_State* L) {
 
     for (uint16_t i = 1; i <= length; ++i) {
         lerl_decodeSmallInteger(L);
-        lua_seti(L, -1, i);
+        lua_seti(L, -2, i);
     }
     return 1;
 }
@@ -755,7 +788,7 @@ static int lerl_unpack(lua_State* L) {
     lerl_decoder* the_decoder = lerl_get_decoder(L, 1);
 
     if (the_decoder->invalid)
-        return 0;
+        return luaL_error(L, "Unpacking an invalidated buffer");
 
     if (the_decoder->offset > the_decoder->size)
         return luaL_error(L, "Unpacking beyond the end of the buffer");
@@ -842,6 +875,17 @@ static int lerl_unpack_fun(lua_State* L) {
     }
 }
 
+static int lerl_unpack_all(lua_State* L) {
+    lerl_decoder* the_decoder = lerl_get_decoder(L, 1);
+    int count = 0;
+    while((the_decoder->offset < the_decoder->size) && !the_decoder->invalid){
+        count = count + 1;
+        lerl_unpack(L);
+    }
+    lua_remove(L, 1);
+    return count;
+}
+
 static int lerl_decoder_gc(lua_State* L) {
     lerl_decoder* the_decoder = lerl_get_decoder(L, 1);
 
@@ -894,6 +938,7 @@ const luaL_Reg decoder_metamethods[] = {
 
 const luaL_Reg decoder_methods[] = {
     {"unpack", lerl_unpack_fun},
+    {"unpack_all", lerl_unpack_all},
     {"reset", lerl_reset_decoder},
     {"read8", lerl_read8},
     {"read16", lerl_read16},
@@ -907,6 +952,7 @@ const luaL_Reg lerl_functions[] = {
     {"new_decoder", lerl_new_decoder},
     {"lerl_map", lerl_make_map},
     {"lerl_array", lerl_make_array},
+    {"empty_decoder", lerl_empty_decoder},
     {NULL, NULL}
 };
 
