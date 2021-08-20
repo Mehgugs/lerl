@@ -63,7 +63,7 @@ static int lerl_new_encoder(lua_State* L) {
 static int lerl_encoder_gc(lua_State* L) {
     lerl_encoder* e = lerl_get_encoder(L, 1);
 
-    if (e->pk.buf) {
+    if (e->pk.buf != NULL) {
         free(e->pk.buf);
     }
 
@@ -78,6 +78,10 @@ static int lerl_pack_at(lua_State* L, int encoder_at, int object_at, int limit) 
         return luaL_error(L, "lerl_encoder:pack Maximum pack depth reached!");
 
     lerl_encoder* e = lerl_get_encoder(L, encoder_at);
+
+    if (e->ret != 0)
+        return luaL_error(L, "lerl_encoder:pack Encoder buffer is in a bad state.");
+
     int the_type = lua_type(L, object_at);
     int ret;
     switch (the_type) {
@@ -202,10 +206,11 @@ static int lerl_pack_at(lua_State* L, int encoder_at, int object_at, int limit) 
                     check_ret("upsert map length")
 
                 } else if (flen == 4 && strncmp(ttype, "user", 4) == 0) {
+                    lua_pop(L, 1);
                     if (luaL_getmetafield(L, object_at, "__lerl_user") != LUA_TNIL) {
                         lua_pushvalue(L, object_at);
-                        lua_call(L, 2, 1);
-                        return lerl_pack_at(L, encoder_at, -1, limit - 1);
+                        lua_call(L, 1, 1);
+                        return lerl_pack_at(L, encoder_at, lua_gettop(L), limit - 1);
                     }
                 } else {
                     return luaL_error(L, "lerl_encoder.pack: Unsure what to do with a table with a strange lerl_type set.");
@@ -243,6 +248,18 @@ static int lerl_pack(lua_State* L) {
    return 1;
 }
 
+static int lerl_pack_all(lua_State* L) {
+    lerl_encoder* e = lerl_get_encoder(L, 1);
+    int slots = lua_gettop(L);
+    int count = 1;
+    while (count < slots) {
+        count = count + 1;
+        lerl_pack_at(L, 1, count, DEFAULT_RECURSE_LIMIT);
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
 static luaL_Reg encoder_metamethods[] = {
     {"__gc", lerl_encoder_gc},
     {NULL, NULL}
@@ -250,6 +267,7 @@ static luaL_Reg encoder_metamethods[] = {
 
 static luaL_Reg encoder_methods[] = {
     {"pack", lerl_pack},
+    {"pack_all", lerl_pack_all},
     {"release", lerl_release},
     {NULL, NULL}
 };
@@ -947,12 +965,29 @@ const luaL_Reg decoder_methods[] = {
     {NULL, NULL}
 };
 
+static int lerl_pack_encapsulated(lua_State* L) {
+    lua_getfield(L, LUA_REGISTRYINDEX, "lerl_global_encoder");
+    lua_insert(L, 1);
+    lerl_pack_all(L);
+    return lerl_release(L);
+}
+
+static int lerl_unpack_encapsulated(lua_State* L) {
+    lua_getfield(L, LUA_REGISTRYINDEX, "lerl_global_decoder");
+    lua_insert(L, 1);
+    lua_settop(L, 2);
+    lerl_reset_decoder(L);
+    return lerl_unpack_all(L);
+}
+
 const luaL_Reg lerl_functions[] = {
     {"new_encoder", lerl_new_encoder},
     {"new_decoder", lerl_new_decoder},
     {"lerl_map", lerl_make_map},
     {"lerl_array", lerl_make_array},
     {"empty_decoder", lerl_empty_decoder},
+    {"pack", lerl_pack_encapsulated},
+    {"unpack", lerl_unpack_encapsulated},
     {NULL, NULL}
 };
 
@@ -1008,6 +1043,12 @@ LUALIB_API int luaopen_lerl(lua_State* L) {
 
     lerl_encoder_init(L);
     lerl_decoder_init(L);
+
+    lerl_new_encoder2(L, false);
+    lua_setfield(L, LUA_REGISTRYINDEX, "lerl_global_encoder");
+
+    lerl_empty_decoder(L);
+    lua_setfield(L, LUA_REGISTRYINDEX, "lerl_global_decoder");
 
     lua_pushlightuserdata(L, (void*)lerl_empty);
     int default_empty = luaL_ref(L, LUA_REGISTRYINDEX);
